@@ -1,0 +1,69 @@
+# syntax=docker/dockerfile:1
+
+# Repository-CI dependency overlays. BASE_IMAGE must be an immutable image that
+# already implements NeMo RL's rootless runtime contract.
+ARG BASE_IMAGE=766267172432.dkr.ecr.us-east-1.amazonaws.com/nemo-autobot/agent-sandbox@sha256:3a3ebede1c77c8356fa8ea363621e1eb6ad6c763324be9bf768106b6dacb4351
+
+FROM ${BASE_IMAGE} AS runtime
+
+ARG RUNTIME_UID=65532
+ARG RUNTIME_GID=65532
+
+ENV HOME=/home/nemo-runtime \
+    UV_CACHE_DIR=/opt/nemo_rl_cache/uv \
+    UV_PROJECT_ENVIRONMENT=/opt/nemo_rl_venv
+
+USER ${RUNTIME_UID}:${RUNTIME_GID}
+WORKDIR /opt/nemo-rl
+
+# Keep the overlay passive with respect to ownership: it inherits the rootless
+# base and proves every runtime-mutated tree is writable by the final identity.
+RUN set -eux; \
+    test "$(id -u)" = "${RUNTIME_UID}"; \
+    test "$(id -g)" = "${RUNTIME_GID}"; \
+    test "${HOME}" = /home/nemo-runtime; \
+    test -x /usr/local/bin/uv; \
+    test -x /opt/nemo_rl_venv/bin/python; \
+    for path in \
+        /opt/nemo-rl \
+        /opt/nemo-rl-source \
+        /opt/nemo_rl_cache/uv \
+        /opt/ray_venvs \
+        /opt/gym_venvs; do \
+        test -d "${path}"; \
+        touch "${path}/.repository-ci-write-probe"; \
+        rm "${path}/.repository-ci-write-probe"; \
+    done; \
+    if test -e /nemo_run; then \
+        stat -c 'repository-ci /nemo_run uid=%u gid=%g mode=%a' /nemo_run; \
+        test -w /nemo_run; \
+    else \
+        echo 'repository-ci /nemo_run absent'; \
+    fi
+
+FROM runtime AS unit-dependencies
+
+# Unit launchers first run a default `uv run` for asset preparation and then
+# select their backend extra. Prove the same offline default -> mcore transition
+# that the native ARC launcher performs; an import in only the build-time mcore
+# state would miss pruning/reinstallation defects.
+RUN set -eux; \
+    uv sync --link-mode symlink --locked --extra mcore --no-install-project; \
+    UV_OFFLINE=1 uv run python -c 'import nemo_rl'; \
+    UV_OFFLINE=1 uv run --extra mcore python -c \
+        'import megatron.bridge; import megatron.bridge.training'; \
+    test "$(id -u)" = "${RUNTIME_UID}"; \
+    test -w "${UV_CACHE_DIR}"
+
+FROM runtime AS functional-dependencies
+
+# check_metrics.py uses PEP 723 metadata and therefore resolves an isolated uv
+# script environment. Cache its registry artifacts online at build time, then
+# prove a different checkout path can resolve them with the network disabled.
+RUN set -eux; \
+    uv sync --script tests/check_metrics.py; \
+    cp tests/check_metrics.py /tmp/repository-ci-check-metrics.py; \
+    UV_OFFLINE=1 uv sync --script /tmp/repository-ci-check-metrics.py; \
+    rm /tmp/repository-ci-check-metrics.py; \
+    test "$(id -u)" = "${RUNTIME_UID}"; \
+    test -w "${UV_CACHE_DIR}"
