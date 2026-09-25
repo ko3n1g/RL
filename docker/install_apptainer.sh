@@ -152,3 +152,4 @@ esac
 
 apt-get clean
 rm -rf /var/lib/apt/lists/*
+# oci-build-cache session measurement marker (not for merge)
